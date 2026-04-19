@@ -1,120 +1,130 @@
 // ==========================
 // VitalsPatch ESP32
 // This program starts the ESP32, initializes the two sensors,
-// and continuously reads data from them.
+// continuously reads data from them, and sends that data
+// over UART to the STM32 for Maya's side to process.
 // ==========================
 
 
 // -------- Libraries --------
 
-// Include the Wire library.
-// This is used for I2C communication, which is the protocol
-// the ESP32 uses to talk to both the MAX30102 and MPU-6500.
+// Wire library: lets the ESP32 talk over I2C,
+// which is how it communicates with both sensors.
 #include <Wire.h>
 
-// Include the SparkFun MAX3010x library.
-// This library lets us control and read data from the MAX30102 sensor.
+// MAX30105 library: controls the MAX30102 sensor
+// (used for pulse and blood-oxygen-related readings).
 #include "MAX30105.h"
 
-// Include the FastIMU library.
-// This library lets us control and read data from the MPU-6500 sensor.
+// FastIMU library: controls the MPU-6500 sensor
+// (measures motion — acceleration and rotation).
 #include <FastIMU.h>
 
 
 // -------- Objects --------
 
-// Create an object named particleSensor for the MAX30102.
-// "particleSensor" is just the variable name we will use in code
-// whenever we want to configure or read from the MAX30102.
+// Create a sensor object for the MAX30102.
+// We'll use "particleSensor" whenever we talk to it.
 MAX30105 particleSensor;
 
-// Create an object named IMU for the MPU-6500.
-// "IMU" stands for Inertial Measurement Unit, which is a sensor
-// that measures acceleration and rotation.
+// Create a sensor object for the MPU-6500.
+// "IMU" = Inertial Measurement Unit (motion sensor).
 MPU6500 IMU;
 
-// Create a calibration data variable named calib.
-// This stores calibration settings for the MPU sensor.
-// { 0 } means all values start at zero for now.
+// Calibration data holder for the MPU.
+// Starts at zero — we're not calibrating manually here.
 calData calib = { 0 };
 
-// Create a variable named accelData to store accelerometer readings.
-// This will hold acceleration values in the x, y, and z directions.
-AccelData accelData;
+// Temporary holders for the newest MPU readings.
+// The library fills these when we ask for data.
+AccelData accelData;   // holds accel X/Y/Z
+GyroData  gyroData;    // holds gyro  X/Y/Z
 
-// Create a variable named gyroData to store gyroscope readings.
-// This will hold angular velocity values in the x, y, and z directions.
-GyroData gyroData;
 
 // -------- Sensor Data Packet --------
 
-// This struct groups all sensor readings into one place
+// One neat bundle that holds ALL sensor readings.
+// This is what gets sent to the STM32 as a single packet.
+//
+// Using int32_t (instead of "long") guarantees 4 bytes
+// on both the ESP32 and the STM32, so the byte layout
+// matches exactly on both sides. This is important.
 struct SensorData {
-  long ir;     // infrared value from MAX30102
-  long red;    // red light value from MAX30102
+  int32_t ir;     // IR reading from MAX30102 (4 bytes)
+  int32_t red;    // Red reading from MAX30102 (4 bytes)
 
-  float ax;    // acceleration in X direction
-  float ay;    // acceleration in Y direction
-  float az;    // acceleration in Z direction
+  float ax;       // accel X (4 bytes)
+  float ay;       // accel Y (4 bytes)
+  float az;       // accel Z (4 bytes)
 
-  float gx;    // gyro rotation in X
-  float gy;    // gyro rotation in Y
-  float gz;    // gyro rotation in Z
+  float gx;       // gyro  X (4 bytes)
+  float gy;       // gyro  Y (4 bytes)
+  float gz;       // gyro  Z (4 bytes)
 };
+// Total struct size: 32 bytes
 
-// Create one global variable that will store all sensor data
+// A single global "data" variable that every function
+// reads from or writes to. This is the shared bundle.
 SensorData data;
 
 
 // -------- Setup --------
-
-// setup() runs only one time when the ESP32 turns on or resets.
-// We use setup() to initialize things before the main program starts.
+// setup() runs ONCE when the ESP32 powers on or resets.
+// This is where we turn things on and get everything ready.
 void setup() {
 
-  // Start serial communication between the ESP32 and the computer.
-  // 115200 is the communication speed in bits per second.
-  // This lets us print messages to the Serial Monitor for debugging.
+  // Start USB serial (to the computer / Serial Monitor).
+  // Used only for debug prints so we can see what's happening.
   Serial.begin(115200);
 
-  // Wait 1 second so the Serial Monitor has time to connect.
+  // Start Serial2 (UART2) — this is the line going to the STM32.
+  //   115200     = speed in bits per second
+  //   SERIAL_8N1 = 8 data bits, No parity, 1 stop bit (standard)
+  //   16         = RX pin (ESP32 receives on GPIO 16)
+  //   17         = TX pin (ESP32 transmits on GPIO 17)
+  //
+  // WIRING REMINDER:
+  //   ESP32 TX (GPIO 17) --> STM32 RX
+  //   ESP32 RX (GPIO 16) <-- STM32 TX
+  //   ESP32 GND <---------> STM32 GND  (must be shared!)
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);
+
+  // Short pause so the Serial Monitor has time to connect.
   delay(1000);
 
-  // Print a startup message so we know the program began running.
+  // Print startup messages so we know things are alive.
   Serial.println("VitalsPatch ESP32 starting...");
+  Serial.println("Serial2 initialized for STM32 communication");
 
-  // Start I2C communication.
-  // This must happen before the ESP32 can talk to the sensors.
+  // Turn on I2C so we can talk to the two sensors.
   Wire.begin();
-
-  // Print a message confirming I2C has started.
   Serial.println("I2C initialized");
 
-  // Call the function that initializes the MAX30102 sensor.
+  // Get each sensor ready to use.
   initMAX30102();
-
-  // Call the function that initializes the MPU-6500 sensor.
   initMPU6500();
 }
 
 
 // -------- Loop --------
-
-// loop() runs forever after setup() finishes.
-// This is where the ESP32 keeps reading sensor data again and again.
+// loop() runs over and over, FOREVER, after setup() finishes.
+// Each pass: read sensors, fill the struct, send it to the STM32.
 void loop() {
 
-  // Call the function that reads and prints MAX30102 data.
+  // Read the MAX30102 and store values into the shared struct.
   readMAX30102();
 
-  // Call the function that reads and prints MPU-6500 data.
+  // Read the MPU-6500 and store values into the shared struct.
   readMPU6500();
 
-  // Print a separator line so the output is easier to read
-  // in the Serial Monitor between one cycle and the next.
+  // Send the freshly-updated struct to the STM32 over UART2.
+  sendToSTM32();
+
+  // Separator line in the Serial Monitor so output is readable.
   Serial.println("-----------------------------------");
 
-  // Wait 500 milliseconds before reading the sensors again.
+  // Wait half a second before doing it all again.
+  // (Adjust this if you need faster or slower updates.)
   delay(500);
 }
 
@@ -125,58 +135,31 @@ void loop() {
 // --------------------
 // Initialize MAX30102
 // --------------------
-
-// This function sets up the MAX30102 so it is ready to use.
+// Turns on the MAX30102 and applies its settings.
 void initMAX30102() {
 
-  // Print message to show MAX30102 initialization is starting.
   Serial.println("Initializing MAX30102...");
 
-  // Try to start communication with the MAX30102 using I2C.
-  // particleSensor.begin(...) returns false if the sensor is not found.
-  //
-  // particleSensor = the MAX30102 sensor object
-  // Wire = tells the library to use I2C
-  // I2C_SPEED_STANDARD = standard I2C speed (safe default)
+  // Try to start the sensor over I2C at standard speed.
+  // If it's not found, begin() returns false.
   if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-
-    // Print an error message if the sensor was not found.
     Serial.println("MAX30102 was not found. Check wiring and power.");
-
-    // Stop the program completely if the sensor cannot be initialized.
-    // while(1) creates an infinite loop, so the code stays here forever.
+    // Freeze the program here so we notice the problem.
     while (1);
   }
 
-  // These variables store the startup settings for the MAX30102.
+  // Sensor configuration values (safe defaults for PPG signals):
+  byte ledBrightness = 60;    // LED power (higher = brighter)
+  byte sampleAverage = 4;     // averages samples to reduce noise
+  byte ledMode       = 2;     // 2 = Red + IR LEDs both on
+  int  sampleRate    = 100;   // readings per second
+  int  pulseWidth    = 411;   // LED pulse length in microseconds
+  int  adcRange      = 4096;  // ADC measurement range
 
-  // ledBrightness controls how bright the sensor LEDs are.
-  // Higher value = brighter LED.
-  byte ledBrightness = 60;
+  // Apply the settings to the sensor.
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode,
+                       sampleRate, pulseWidth, adcRange);
 
-  // sampleAverage controls how many samples are averaged together.
-  // Averaging helps reduce noise in readings.
-  byte sampleAverage = 4;
-
-  // ledMode controls which LEDs are active.
-  // 2 means Red LED + IR LED are both used.
-  byte ledMode = 2;
-
-  // sampleRate controls how many readings per second the sensor takes.
-  int sampleRate = 100;
-
-  // pulseWidth controls how long each LED pulse lasts.
-  // Larger pulse width can improve sensitivity but may slow things down.
-  int pulseWidth = 411;
-
-  // adcRange controls the measurement range of the sensor ADC.
-  // ADC = analog-to-digital converter.
-  int adcRange = 4096;
-
-  // Apply all of the settings above to the MAX30102 sensor.
-  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
-
-  // Print a success message if setup is complete.
   Serial.println("MAX30102 initialized successfully.");
 }
 
@@ -184,27 +167,23 @@ void initMAX30102() {
 // --------------------
 // Read MAX30102 values
 // --------------------
-
-// This function reads the raw Red and IR values from the MAX30102.
+// Grabs the newest IR and Red values and stores them
+// in the shared 'data' struct so sendToSTM32() can ship them.
 void readMAX30102() {
 
-  // Read the raw infrared value from the sensor and store it in irValue.
-  // "long" is used because sensor values can get large.
-  long irValue = particleSensor.getIR();
-
-  // Read the raw red-light value from the sensor and store it in redValue.
+  // Ask the sensor for the latest IR and Red readings.
+  long irValue  = particleSensor.getIR();
   long redValue = particleSensor.getRed();
 
-  // Print a label so we know this data came from the MAX30102.
+  // Save the values into the shared struct.
+  // Casting to int32_t ensures the struct field size is exact.
+  data.ir  = (int32_t)irValue;
+  data.red = (int32_t)redValue;
+
+  // Debug prints so we can see the values in the Serial Monitor.
   Serial.print("MAX30102 -> IR: ");
-
-  // Print the raw IR value.
   Serial.print(irValue);
-
-  // Print a label before the red value.
   Serial.print("  Red: ");
-
-  // Print the raw red value and move to the next line.
   Serial.println(redValue);
 }
 
@@ -212,35 +191,22 @@ void readMAX30102() {
 // --------------------
 // Initialize MPU-6500
 // --------------------
-
-// This function sets up the MPU-6500 so it is ready to use.
+// Turns on the MPU-6500 motion sensor.
 void initMPU6500() {
 
-  // Print message to show MPU-6500 initialization is starting.
   Serial.println("Initializing MPU-6500...");
 
-  // Try to start communication with the MPU-6500.
-  //
-  // IMU.init(...) returns an error code:
-  // 0 means success
-  // nonzero means something went wrong
-  //
-  // calib = calibration data variable
-  // 0x68 = the usual I2C address of the MPU-6500
+  // Start the sensor. 0x68 is its default I2C address.
+  // init() returns 0 on success, nonzero on failure.
   int err = IMU.init(calib, 0x68);
 
-  // Check whether initialization failed.
   if (err != 0) {
-
-    // Print an error message and the error code.
     Serial.print("MPU-6500 initialization failed. Error: ");
     Serial.println(err);
-
-    // Stop the program completely if the MPU-6500 cannot be initialized.
+    // Freeze the program so the issue is obvious.
     while (1);
   }
 
-  // Print a success message if setup is complete.
   Serial.println("MPU-6500 initialized successfully.");
 }
 
@@ -248,46 +214,82 @@ void initMPU6500() {
 // --------------------
 // Read MPU-6500 values
 // --------------------
-
-// This function updates and prints the accelerometer and gyroscope data.
+// Pulls the newest accel + gyro readings, stores them in
+// the shared 'data' struct, and also prints them for debug.
 void readMPU6500() {
 
-  // Update the sensor so the library gets the newest readings.
+  // Step 1: Tell the library to grab fresh data from the sensor.
   IMU.update();
 
-  // Copy the newest accelerometer values into accelData.
-  // The "&" means we are giving the function the address of accelData
-  // so it can fill that variable with data.
+  // Step 2: Copy that data into the temporary holders.
   IMU.getAccel(&accelData);
-
-  // Copy the newest gyroscope values into gyroData.
   IMU.getGyro(&gyroData);
 
-  // Print a label to show these are accelerometer readings.
+  // Step 3: Copy from the temporary holders into the shared struct.
+  // This is the struct that sendToSTM32() will actually transmit.
+  data.ax = accelData.accelX;
+  data.ay = accelData.accelY;
+  data.az = accelData.accelZ;
+
+  data.gx = gyroData.gyroX;
+  data.gy = gyroData.gyroY;
+  data.gz = gyroData.gyroZ;
+
+  // Debug prints — accelerometer values.
   Serial.print("MPU6500 -> Accel X: ");
-
-  // Print acceleration in the X direction.
   Serial.print(accelData.accelX);
-
-  // Print label and acceleration in the Y direction.
   Serial.print("  Y: ");
   Serial.print(accelData.accelY);
-
-  // Print label and acceleration in the Z direction.
   Serial.print("  Z: ");
   Serial.println(accelData.accelZ);
 
-  // Print a label to show these are gyroscope readings.
+  // Debug prints — gyroscope values.
   Serial.print("MPU6500 -> Gyro  X: ");
-
-  // Print angular velocity in the X direction.
   Serial.print(gyroData.gyroX);
-
-  // Print label and angular velocity in the Y direction.
   Serial.print("  Y: ");
   Serial.print(gyroData.gyroY);
-
-  // Print label and angular velocity in the Z direction.
   Serial.print("  Z: ");
   Serial.println(gyroData.gyroZ);
+}
+
+
+// --------------------
+// Send data to STM32
+// --------------------
+// Sends the shared 'data' struct to the STM32 as a single
+// framed binary packet.
+//
+// Packet format (34 bytes total):
+//   [0xAA] [0x55] [32 bytes of SensorData] [1 byte checksum]
+//
+// - 0xAA 0x55 = "sync header". Tells the STM32: "a new packet starts here."
+// - Payload   = the raw bytes of the SensorData struct.
+// - Checksum  = XOR of all payload bytes. Lets the STM32 check
+//               that the data didn't get corrupted on the way over.
+void sendToSTM32() {
+
+  // The two header bytes that mark the start of a packet.
+  uint8_t header[2] = { 0xAA, 0x55 };
+
+  // Treat the struct as a raw stream of bytes.
+  // (uint8_t*) = "pretend this is a pointer to bytes"
+  // &data      = "the memory address of our struct"
+  uint8_t* payload     = (uint8_t*)&data;
+  size_t   payloadSize = sizeof(SensorData);   // should be 32
+
+  // Compute a simple XOR checksum across the payload.
+  // XOR-ing every byte into 'checksum' gives a single byte
+  // that the STM32 can recompute and compare.
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < payloadSize; i++) {
+    checksum ^= payload[i];
+  }
+
+  // Send the three pieces, in order, over UART2:
+  //   1) the 2-byte header
+  //   2) the 32-byte payload
+  //   3) the 1-byte checksum
+  Serial2.write(header, 2);
+  Serial2.write(payload, payloadSize);
+  Serial2.write(checksum);
 }
