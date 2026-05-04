@@ -1,0 +1,229 @@
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+
+// ===================== CONFIG =====================
+// make buffers bigger or smaller depending on how often get data, etc. 
+#define BUFFER_SIZE 100
+#define OUTPUT_SIZE 100
+
+// ===================== ALERT BITMASK =====================
+#define ALERT_HR_LOW    (1 << 0)
+#define ALERT_HR_HIGH   (1 << 1)
+#define ALERT_TEMP_HIGH (1 << 2)
+#define ALERT_TEMP_LOW  (1 << 3)
+#define ALERT_SPO2_LOW  (1 << 4)
+#define ALERT_FALL      (1 << 5)
+
+// ===================== OUTPUT STRUCT =====================
+
+typedef struct {
+    uint32_t timestamp;
+    float hr;
+    float spo2;
+    float temp;
+    float acc_mag;
+} ProcessedData;
+
+ProcessedData data_out[OUTPUT_SIZE];
+uint8_t alert_flags[OUTPUT_SIZE];
+int out_index = 0;
+
+// ===================== SENSOR BUFFERS =====================
+
+typedef struct { uint32_t t; uint16_t bpm; } HeartRateSample;
+typedef struct { uint32_t t; float spo2; } SpO2Sample;
+typedef struct { uint32_t t; float temp; } TempSample;
+
+typedef struct {
+    uint32_t t;
+    float ax, ay, az;
+    float gx, gy, gz;
+} MotionSample;
+
+HeartRateSample hr_buffer[BUFFER_SIZE];
+SpO2Sample spo2_buffer[BUFFER_SIZE];
+TempSample temp_buffer[BUFFER_SIZE];
+MotionSample motion_buffer[BUFFER_SIZE];
+
+int hr_index = 0, spo2_index = 0, temp_index = 0, motion_index = 0;
+
+// ===================== ADD DATA =====================
+
+void add_hr(uint32_t t, uint16_t bpm) {
+    hr_buffer[hr_index++] = (HeartRateSample){t, bpm};
+    hr_index %= BUFFER_SIZE;
+}
+
+void add_spo2(uint32_t t, float spo2) {
+    spo2_buffer[spo2_index++] = (SpO2Sample){t, spo2};
+    spo2_index %= BUFFER_SIZE;
+}
+
+void add_temp(uint32_t t, float temp) {
+    temp_buffer[temp_index++] = (TempSample){t, temp};
+    temp_index %= BUFFER_SIZE;
+}
+
+void add_motion(uint32_t t, float ax, float ay, float az,
+                               float gx, float gy, float gz) {
+    motion_buffer[motion_index++] = (MotionSample){t, ax, ay, az, gx, gy, gz};
+    motion_index %= BUFFER_SIZE;
+}
+
+// ===================== ANALYSIS =====================
+
+uint8_t analyze_hr(uint16_t bpm) {
+    uint8_t f = 0;
+    if (bpm < 60)  f |= ALERT_HR_LOW;
+    if (bpm > 100) f |= ALERT_HR_HIGH;
+    return f;
+}
+// is sensor in C or F??
+uint8_t analyze_temp(float temp) {
+    uint8_t f = 0;
+    if (temp > 38.0f) f |= ALERT_TEMP_HIGH;
+    if (temp < 35.0f) f |= ALERT_TEMP_LOW;
+    return f;
+}
+
+uint8_t analyze_spo2(float spo2) {
+    return (spo2 < 90.0f) ? ALERT_SPO2_LOW : 0;
+}
+
+// ===================== MOTION =====================
+
+float accel_mag(float ax, float ay, float az) {
+    return sqrtf(ax*ax + ay*ay + az*az);
+}
+
+float gyro_mag(float gx, float gy, float gz) {
+    return fabs(gx) + fabs(gy) + fabs(gz);
+}
+
+int is_flat(float az) { return fabs(az) < 0.5f; }
+int is_still(float gx, float gy, float gz) {
+    return (fabs(gx)+fabs(gy)+fabs(gz)) < 10.0f;
+}
+
+// ===================== FALL DETECTION =====================
+// will have to adjust these values based on testing what the sensors actually read 
+typedef enum { NORMAL, FREEFALL, IMPACT, FLAT } FallState;
+
+FallState fall_state = NORMAL;
+uint32_t fall_timer = 0;
+int fall_flag = 0;
+
+void analyze_motion(uint32_t t) {
+
+    int i = (motion_index - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    MotionSample s = motion_buffer[i];
+
+    float acc = accel_mag(s.ax, s.ay, s.az);
+    float gyro = gyro_mag(s.gx, s.gy, s.gz);
+
+    switch (fall_state) {
+
+        case NORMAL:
+            if (acc < 0.5f) {
+                fall_state = FREEFALL;
+                fall_timer = t;
+            }
+            break;
+
+        case FREEFALL:
+            if (acc > 2.5f) fall_state = IMPACT;
+            else if (t - fall_timer > 1000) fall_state = NORMAL;
+            break;
+
+        case IMPACT:
+            if (is_flat(s.az) && gyro > 150.0f) {
+                fall_state = FLAT;
+                fall_timer = t;
+            } else fall_state = NORMAL;
+            break;
+
+        case FLAT:
+            if (is_still(s.gx, s.gy, s.gz) && (t - fall_timer > 1500)) {
+                fall_flag = 1;
+                fall_state = NORMAL;
+            } else if (!is_still(s.gx, s.gy, s.gz)) {
+                fall_state = NORMAL;
+            }
+            break;
+    }
+}
+
+// ===================== UART SEND =====================
+
+void send_to_pi(uint32_t t, float hr, float spo2, float temp,
+                float acc, uint8_t flags)
+{
+    // Replace printf with UART transmit if needed
+    printf("%u,%.0f,%.1f,%.1f,%.2f,%u\n",
+           t, hr, spo2, temp, acc, flags);
+}
+
+// ===================== PROCESS =====================
+
+void process_step(uint32_t t) {
+
+    int hi = (hr_index - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    int si = (spo2_index - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    int ti = (temp_index - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    int mi = (motion_index - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+
+    float hr = hr_buffer[hi].bpm;
+    float spo2 = spo2_buffer[si].spo2;
+    float temp = temp_buffer[ti].temp;
+
+    MotionSample m = motion_buffer[mi];
+    float acc = accel_mag(m.ax, m.ay, m.az);
+
+    uint8_t flags = 0;
+
+    flags |= analyze_hr(hr);
+    flags |= analyze_temp(temp);
+    flags |= analyze_spo2(spo2);
+
+    if (fall_flag) {
+        flags |= ALERT_FALL;
+        fall_flag = 0;
+    }
+
+    data_out[out_index] = (ProcessedData){t, hr, spo2, temp, acc};
+    alert_flags[out_index] = flags;
+
+    send_to_pi(t, hr, spo2, temp, acc, flags);
+
+    out_index = (out_index + 1) % OUTPUT_SIZE;
+}
+
+// ===================== MAIN ENTRY =====================
+
+void update_system(uint32_t t,
+                   uint16_t bpm,
+                   float spo2,
+                   float temp,
+                   float ax, float ay, float az,
+                   float gx, float gy, float gz)
+{
+    add_hr(t, bpm);
+    add_spo2(t, spo2);
+    add_temp(t, temp);
+    add_motion(t, ax, ay, az, gx, gy, gz);
+
+    analyze_motion(t);
+    process_step(t);
+}
+
+int main(void)
+{
+    // Example test call (replace with real sensor data later)
+    update_system(0, 72, 98.0, 36.5,
+                  0.0, 0.0, 1.0,
+                  0.0, 0.0, 0.0);
+
+    return 0;
+}
