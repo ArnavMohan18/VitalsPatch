@@ -2,93 +2,172 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : STM32F407G-DISC1 USB CDC Patient Monitor
   ******************************************************************************
-  * @attention
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * Sends analyzed patient telemetry to Raspberry Pi over USB CDC.
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * CN1 = ST-LINK power/programming
+  * CN5 = USB CDC data to Raspberry Pi
   *
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
+
 #include "main.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
+
+#include <stdio.h>
 #include <string.h>
+#include <math.h>
+
 #include "usbd_cdc_if.h"
 
-/* USER CODE END Includes */
-
 /* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
 
-/* USER CODE END PTD */
+typedef struct
+{
+    uint16_t hr;
+    float spo2;
+    float temp_c;
+
+    float ax;
+    float ay;
+    float az;
+
+    float gx;
+    float gy;
+    float gz;
+
+} FakeData;
+
+typedef enum
+{
+    NORMAL,
+    FREEFALL,
+    IMPACT,
+    FLAT
+
+} FallState;
 
 /* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
 
-/* USER CODE END PD */
+#define ALERT_HR_LOW      (1 << 0)
+#define ALERT_HR_HIGH     (1 << 1)
+#define ALERT_TEMP_HIGH   (1 << 2)
+#define ALERT_TEMP_LOW    (1 << 3)
+#define ALERT_SPO2_LOW    (1 << 4)
+#define ALERT_FALL        (1 << 5)
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
+#define FAKE_DATA_COUNT 12
 
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-I2C_HandleTypeDef hi2c1;
-
-I2S_HandleTypeDef hi2s3;
-
-SPI_HandleTypeDef hspi1;
-
-/* USER CODE BEGIN PV */
-#define NUM_PACKETS 10
-
-const char *test_packets[NUM_PACKETS] = {
-    // Normal Patient 1
-    "Patient:1;HR:[75,76,74];SPO2:[98,99,97];TEMP:[98.4,98.5,98.3];ERR:[0,0,0,0,0,0]\r\n",
-
-    // Normal Patient 2
-    "Patient:2;HR:[80,81,79];SPO2:[97,98,98];TEMP:[98.6,98.5,98.7];ERR:[0,0,0,0,0,0]\r\n",
-
-    // Patient 1 high heart rate
-    "Patient:1;HR:[128,132,130];SPO2:[98,97,98];TEMP:[98.5,98.6,98.4];ERR:[1,0,0,0,0,0]\r\n",
-
-    // Patient 2 low heart rate
-    "Patient:2;HR:[45,47,46];SPO2:[98,99,98];TEMP:[98.4,98.5,98.3];ERR:[2,0,0,0,0,0]\r\n",
-
-    // Patient 1 temperature spike
-    "Patient:1;HR:[82,84,83];SPO2:[97,98,97];TEMP:[101.2,101.5,101.3];ERR:[0,0,3,0,0,0]\r\n",
-
-    // Patient 2 temperature drop
-    "Patient:2;HR:[78,77,79];SPO2:[97,98,97];TEMP:[94.8,95.0,94.9];ERR:[0,0,0,4,0,0]\r\n",
-
-    // Patient 1 low SpO2
-    "Patient:1;HR:[88,90,89];SPO2:[89,90,88];TEMP:[98.6,98.5,98.7];ERR:[0,0,0,0,5,0]\r\n",
-
-    // Patient 2 fall detected
-    "Patient:2;HR:[95,100,98];SPO2:[96,97,96];TEMP:[98.4,98.5,98.4];ERR:[0,0,0,0,0,6]\r\n",
-
-    // Patient 1 multiple alerts
-    "Patient:1;HR:[135,138,136];SPO2:[90,89,91];TEMP:[102.0,102.3,102.1];ERR:[1,0,3,0,5,0]\r\n",
-
-    // Patient 2 recovery
-    "Patient:2;HR:[82,81,80];SPO2:[98,99,98];TEMP:[98.5,98.4,98.6];ERR:[0,0,0,0,0,0]\r\n"
+const char *state_str[] =
+{
+    "NORMAL",
+    "FREEFALL",
+    "IMPACT",
+    "FLAT"
 };
 
-/*void send_packet(const char *packet) {
-   HAL_UART_Transmit(&huart2, (uint8_t*)packet, strlen(packet), 100);
-   HAL_Delay(5);
-}*/
-void send_packet(const char *packet)
+/* Private variables ---------------------------------------------------------*/
+
+I2C_HandleTypeDef hi2c1;
+I2S_HandleTypeDef hi2s3;
+SPI_HandleTypeDef hspi1;
+
+FakeData fake_data[FAKE_DATA_COUNT] =
+{
+    // Normal
+    {75,98.0,36.5, 0.0,0.0,1.0, 2,1,1},
+
+    // Normal
+    {78,97.0,36.6, 0.1,0.1,1.0, 3,2,1},
+
+    // High HR
+    {120,98.0,36.7, 0.0,0.0,1.0, 2,2,1},
+
+    // Low HR
+    {45,99.0,36.5, 0.0,0.0,1.0, 1,1,1},
+
+    // Low SPO2
+    {85,86.0,36.6, 0.0,0.0,1.0, 2,1,1},
+
+    // Temp spike
+    {88,97.0,39.5, 0.0,0.0,1.0, 3,2,1},
+
+    // Temp low
+    {76,98.0,33.0, 0.0,0.0,1.0, 2,1,1},
+
+    // Walking
+    {80,98.0,36.5, 0.3,0.2,1.0, 10,8,6},
+
+    // FREEFALL
+    {92,96.0,36.7, 0.1,0.1,0.1, 20,15,10},
+
+    // IMPACT
+    {94,95.0,36.8, 3.5,2.0,0.2, 180,160,140},
+
+    // FLAT/STILL
+    {93,95.0,36.8, 0.0,0.0,0.1, 1,1,1},
+
+    // Recovery
+    {82,98.0,36.5, 0.0,0.0,1.0, 3,2,1}
+};
+
+int data_index = 0;
+
+FallState fall_state = NORMAL;
+
+uint32_t fall_timer = 0;
+
+uint8_t fall_detected = 0;
+
+/* Private function prototypes -----------------------------------------------*/
+
+void SystemClock_Config(void);
+
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_I2S3_Init(void);
+static void MX_SPI1_Init(void);
+
+void send_packet(char *packet);
+
+uint8_t analyze_hr(uint16_t bpm);
+uint8_t analyze_temp(float temp);
+uint8_t analyze_spo2(float spo2);
+
+float accel_mag(float ax, float ay, float az);
+float gyro_mag(float gx, float gy, float gz);
+
+int is_flat(float az);
+int is_still(float gx, float gy, float gz);
+
+void analyze_motion(
+    uint32_t t,
+    float ax,
+    float ay,
+    float az,
+    float gx,
+    float gy,
+    float gz
+);
+
+void send_patient_packet(
+    int patient,
+    uint16_t hr,
+    float spo2,
+    float temp_c,
+    uint8_t flags
+);
+
+/* Private user code ---------------------------------------------------------*/
+
+void send_packet(char *packet)
 {
     while (CDC_Transmit_FS((uint8_t*)packet, strlen(packet)) == USBD_BUSY)
     {
@@ -96,373 +175,389 @@ void send_packet(const char *packet)
     }
 }
 
+uint8_t analyze_hr(uint16_t bpm)
+{
+    uint8_t f = 0;
 
-int packet_index = 0;
+    if (bpm < 60)
+        f |= ALERT_HR_LOW;
 
+    if (bpm > 100)
+        f |= ALERT_HR_HIGH;
 
-/* USER CODE END PV */
+    return f;
+}
 
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
-static void MX_I2S3_Init(void);
-static void MX_SPI1_Init(void);
-/* USER CODE BEGIN PFP */
+uint8_t analyze_temp(float temp)
+{
+    uint8_t f = 0;
 
-/* USER CODE END PFP */
+    if (temp > 38.0f)
+        f |= ALERT_TEMP_HIGH;
 
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
+    if (temp < 35.0f)
+        f |= ALERT_TEMP_LOW;
 
-/* USER CODE END 0 */
+    return f;
+}
+
+uint8_t analyze_spo2(float spo2)
+{
+    if (spo2 < 90.0f)
+        return ALERT_SPO2_LOW;
+
+    return 0;
+}
+
+float accel_mag(float ax, float ay, float az)
+{
+    return sqrtf(ax*ax + ay*ay + az*az);
+}
+
+float gyro_mag(float gx, float gy, float gz)
+{
+    return fabsf(gx) + fabsf(gy) + fabsf(gz);
+}
+
+int is_flat(float az)
+{
+    return fabsf(az) < 0.5f;
+}
+
+int is_still(float gx, float gy, float gz)
+{
+    return (fabsf(gx) + fabsf(gy) + fabsf(gz)) < 10.0f;
+}
+
+void analyze_motion(
+    uint32_t t,
+    float ax,
+    float ay,
+    float az,
+    float gx,
+    float gy,
+    float gz
+)
+{
+    float acc = accel_mag(ax, ay, az);
+
+    float gyro = gyro_mag(gx, gy, gz);
+
+    switch(fall_state)
+    {
+        case NORMAL:
+
+            if(acc < 0.5f)
+            {
+                fall_state = FREEFALL;
+                fall_timer = t;
+            }
+
+            break;
+
+        case FREEFALL:
+
+            if(acc > 2.5f)
+            {
+                fall_state = IMPACT;
+            }
+            else if((t - fall_timer) > 1000)
+            {
+                fall_state = NORMAL;
+            }
+
+            break;
+
+        case IMPACT:
+
+            if(is_flat(az) && gyro > 150.0f)
+            {
+                fall_state = FLAT;
+                fall_timer = t;
+            }
+            else
+            {
+                fall_state = NORMAL;
+            }
+
+            break;
+
+        case FLAT:
+
+            if(is_still(gx, gy, gz) &&
+               ((t - fall_timer) > 1500))
+            {
+                fall_detected = 1;
+                fall_state = NORMAL;
+            }
+            else if(!is_still(gx, gy, gz))
+            {
+                fall_state = NORMAL;
+            }
+
+            break;
+    }
+}
+
+void send_patient_packet(
+    int patient,
+    uint16_t hr,
+    float spo2,
+    float temp_c,
+    uint8_t flags
+)
+{
+    char packet[256];
+
+    int err[6] = {0};
+
+    if(flags & ALERT_HR_HIGH)   err[0] = 1;
+    if(flags & ALERT_HR_LOW)    err[1] = 2;
+    if(flags & ALERT_TEMP_HIGH) err[2] = 3;
+    if(flags & ALERT_TEMP_LOW)  err[3] = 4;
+    if(flags & ALERT_SPO2_LOW)  err[4] = 5;
+    if(flags & ALERT_FALL)      err[5] = 6;
+
+    float temp_f = (temp_c * 9.0f / 5.0f) + 32.0f;
+    int t1 = (int)(temp_f * 10);
+    int t2 = (int)((temp_f + 0.1f) * 10);
+    int t3 = (int)((temp_f - 0.1f) * 10);
+
+    snprintf(packet,
+             sizeof(packet),
+
+             "Patient:%d;"
+             "HR:[%d,%d,%d];"
+             "SPO2:[%d,%d,%d];"
+             "TEMP:[%d.%d,%d.%d,%d.%d];"
+             "ERR:[%d,%d,%d,%d,%d,%d]\r\n",
+
+             patient,
+
+             hr,
+             hr + 1,
+             hr - 1,
+
+             (int)spo2,
+             (int)(spo2 + 1),
+             (int)(spo2 - 1),
+
+             t1/10, abs(t1%10),
+             t2/10, abs(t2%10),
+             t3/10, abs(t3%10),
+
+             err[0],
+             err[1],
+             err[2],
+             err[3],
+             err[4],
+             err[5]
+    );
+    send_packet(packet);
+}
 
 /**
   * @brief  The application entry point.
-  * @retval int
   */
+
 int main(void)
 {
+    HAL_Init();
 
-  /* USER CODE BEGIN 1 */
+    SystemClock_Config();
 
-  /* USER CODE END 1 */
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_I2S3_Init();
+    MX_SPI1_Init();
+    MX_USB_DEVICE_Init();
 
-  /* MCU Configuration--------------------------------------------------------*/
+    HAL_Delay(2000);
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+    while (1)
+    {
+        FakeData d = fake_data[data_index];
 
-  /* USER CODE BEGIN Init */
+        uint8_t flags = 0;
 
-  /* USER CODE END Init */
+        uint32_t current_time = HAL_GetTick();
 
-  /* Configure the system clock */
-  SystemClock_Config();
+        flags |= analyze_hr(d.hr);
+        flags |= analyze_spo2(d.spo2);
+        flags |= analyze_temp(d.temp_c);
 
-  /* USER CODE BEGIN SysInit */
+        analyze_motion(
+            current_time,
+            d.ax,
+            d.ay,
+            d.az,
+            d.gx,
+            d.gy,
+            d.gz
+        );
 
-  /* USER CODE END SysInit */
+        if(fall_detected)
+        {
+            flags |= ALERT_FALL;
+            fall_detected = 0;
+        }
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_I2C1_Init();
-  MX_I2S3_Init();
-  MX_SPI1_Init();
-  MX_USB_DEVICE_Init();
-  /* USER CODE BEGIN 2 */
-HAL_Delay(2000);
-  /* USER CODE END 2 */
+        send_patient_packet(
+            1,
+            d.hr,
+            d.spo2,
+            d.temp_c,
+            flags
+        );
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+        HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);
 
+        data_index++;
 
+        if(data_index >= FAKE_DATA_COUNT)
+        {
+            data_index = 0;
+        }
 
-	  send_packet(test_packets[packet_index]);
-	  HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);
-	  packet_index++;
-
-	  if (packet_index >= NUM_PACKETS)
-	  {
-	  packet_index = 0;
-	  }
-
-	  HAL_Delay(1000);
-
-
-
-
-
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
+        HAL_Delay(1000);
+    }
 }
 
 /**
   * @brief System Clock Configuration
-  * @retval None
   */
+
 void SystemClock_Config(void)
 {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+    __HAL_RCC_PWR_CLK_ENABLE();
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 8;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 7;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM = 8;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ = 7;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_PLLCLK;
+
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV4;
+
+    RCC_ClkInitStruct.APB2CLKDivider =
+        RCC_HCLK_DIV2;
+
+    if (HAL_RCC_ClockConfig(
+            &RCC_ClkInitStruct,
+            FLASH_LATENCY_5) != HAL_OK)
+    {
+        Error_Handler();
+    }
 }
 
-/**
-  * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_I2C1_Init(void)
 {
+    hi2c1.Instance = I2C1;
 
-  /* USER CODE BEGIN I2C1_Init 0 */
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
 
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
 }
 
-/**
-  * @brief I2S3 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_I2S3_Init(void)
 {
+    hi2s3.Instance = SPI3;
 
-  /* USER CODE BEGIN I2S3_Init 0 */
+    hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
+    hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
+    hi2s3.Init.DataFormat = I2S_DATAFORMAT_16B;
+    hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
+    hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_96K;
+    hi2s3.Init.CPOL = I2S_CPOL_LOW;
+    hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
+    hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
 
-  /* USER CODE END I2S3_Init 0 */
-
-  /* USER CODE BEGIN I2S3_Init 1 */
-
-  /* USER CODE END I2S3_Init 1 */
-  hi2s3.Instance = SPI3;
-  hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
-  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
-  hi2s3.Init.DataFormat = I2S_DATAFORMAT_16B;
-  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
-  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_96K;
-  hi2s3.Init.CPOL = I2S_CPOL_LOW;
-  hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
-  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
-  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2S3_Init 2 */
-
-  /* USER CODE END I2S3_Init 2 */
-
+    if (HAL_I2S_Init(&hi2s3) != HAL_OK)
+    {
+        Error_Handler();
+    }
 }
 
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_SPI1_Init(void)
 {
+    hspi1.Instance = SPI1;
 
-  /* USER CODE BEGIN SPI1_Init 0 */
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi1.Init.CRCPolynomial = 10;
 
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
+    if (HAL_SPI_Init(&hspi1) != HAL_OK)
+    {
+        Error_Handler();
+    }
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-  /* USER CODE END MX_GPIO_Init_1 */
+    __HAL_RCC_GPIOD_CLK_ENABLE();
 
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
+    GPIO_InitStruct.Pin = GPIO_PIN_12;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : CS_I2C_SPI_Pin */
-  GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PDM_OUT_Pin */
-  GPIO_InitStruct.Pin = PDM_OUT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-  HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : BOOT1_Pin */
-  GPIO_InitStruct.Pin = BOOT1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : CLK_IN_Pin */
-  GPIO_InitStruct.Pin = CLK_IN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-  HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
-                           Audio_RST_Pin */
-  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : MEMS_INT2_Pin */
-  GPIO_InitStruct.Pin = MEMS_INT2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
+    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 }
 
-/* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+    __disable_irq();
+
+    while (1)
+    {
+    }
 }
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
+
