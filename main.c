@@ -2,27 +2,24 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32F407G-DISC1 USB CDC Patient Monitor
+  * @brief          : STM32F407 Dual HM-19 USB CDC Patient Monitor
   ******************************************************************************
   *
-  * Sends analyzed patient telemetry to Raspberry Pi over USB CDC.
+  * USART2 -> HM19 Patient #1
+  * USART3 -> HM19 Patient #2
   *
-  * CN1 = ST-LINK power/programming
-  * CN5 = USB CDC data to Raspberry Pi
+  * USB CDC -> Raspberry Pi
   *
   ******************************************************************************
   */
 /* USER CODE END Header */
 
-/* Includes ------------------------------------------------------------------*/
-
 #include "main.h"
 #include "usb_device.h"
 
-/* Private includes ----------------------------------------------------------*/
-
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 
 #include "usbd_cdc_if.h"
@@ -31,6 +28,8 @@
 
 typedef struct
 {
+    uint32_t timestamp;
+
     uint16_t hr;
     float spo2;
     float temp_c;
@@ -43,7 +42,7 @@ typedef struct
     float gy;
     float gz;
 
-} FakeData;
+} SensorData;
 
 typedef enum
 {
@@ -56,6 +55,8 @@ typedef enum
 
 /* Private define ------------------------------------------------------------*/
 
+#define RX_LINE_SIZE 180
+
 #define ALERT_HR_LOW      (1 << 0)
 #define ALERT_HR_HIGH     (1 << 1)
 #define ALERT_TEMP_HIGH   (1 << 2)
@@ -63,70 +64,36 @@ typedef enum
 #define ALERT_SPO2_LOW    (1 << 4)
 #define ALERT_FALL        (1 << 5)
 
-#define FAKE_DATA_COUNT 12
-
-const char *state_str[] =
-{
-    "NORMAL",
-    "FREEFALL",
-    "IMPACT",
-    "FLAT"
-};
-
 /* Private variables ---------------------------------------------------------*/
 
 I2C_HandleTypeDef hi2c1;
 I2S_HandleTypeDef hi2s3;
 SPI_HandleTypeDef hspi1;
 
-FakeData fake_data[FAKE_DATA_COUNT] =
-{
-    // Normal
-    {75,98.0,36.5, 0.0,0.0,1.0, 2,1,1},
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
 
-    // Normal
-    {78,97.0,36.6, 0.1,0.1,1.0, 3,2,1},
+/* UART RX */
 
-    // High HR
-    {120,98.0,36.7, 0.0,0.0,1.0, 2,2,1},
+uint8_t rx2_byte;
+char rx2_line[RX_LINE_SIZE];
+uint16_t rx2_index = 0;
 
-    // Low HR
-    {45,99.0,36.5, 0.0,0.0,1.0, 1,1,1},
+uint8_t rx3_byte;
+char rx3_line[RX_LINE_SIZE];
+uint16_t rx3_index = 0;
 
-    // Low SPO2
-    {85,86.0,36.6, 0.0,0.0,1.0, 2,1,1},
+/* Patient states */
 
-    // Temp spike
-    {88,97.0,39.5, 0.0,0.0,1.0, 3,2,1},
+FallState fall_state_1 = NORMAL;
+uint32_t fall_timer_1 = 0;
+uint8_t fall_detected_1 = 0;
 
-    // Temp low
-    {76,98.0,33.0, 0.0,0.0,1.0, 2,1,1},
+FallState fall_state_2 = NORMAL;
+uint32_t fall_timer_2 = 0;
+uint8_t fall_detected_2 = 0;
 
-    // Walking
-    {80,98.0,36.5, 0.3,0.2,1.0, 10,8,6},
-
-    // FREEFALL
-    {92,96.0,36.7, 0.1,0.1,0.1, 20,15,10},
-
-    // IMPACT
-    {94,95.0,36.8, 3.5,2.0,0.2, 180,160,140},
-
-    // FLAT/STILL
-    {93,95.0,36.8, 0.0,0.0,0.1, 1,1,1},
-
-    // Recovery
-    {82,98.0,36.5, 0.0,0.0,1.0, 3,2,1}
-};
-
-int data_index = 0;
-
-FallState fall_state = NORMAL;
-
-uint32_t fall_timer = 0;
-
-uint8_t fall_detected = 0;
-
-/* Private function prototypes -----------------------------------------------*/
+/* Function prototypes */
 
 void SystemClock_Config(void);
 
@@ -134,6 +101,9 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
+
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
 
 void send_packet(char *packet);
 
@@ -148,6 +118,9 @@ int is_flat(float az);
 int is_still(float gx, float gy, float gz);
 
 void analyze_motion(
+    FallState *state,
+    uint32_t *timer,
+    uint8_t *fall_detected,
     uint32_t t,
     float ax,
     float ay,
@@ -165,13 +138,26 @@ void send_patient_packet(
     uint8_t flags
 );
 
-/* Private user code ---------------------------------------------------------*/
+int parse_vp1_packet(char *line, SensorData *d);
+
+void process_sensor_packet(
+    int patient,
+    SensorData *d,
+    FallState *fall_state,
+    uint32_t *fall_timer,
+    uint8_t *fall_detected
+);
+
+/* USER CODE BEGIN 0 */
 
 void send_packet(char *packet)
 {
+    uint32_t timeout = HAL_GetTick();
+
     while (CDC_Transmit_FS((uint8_t*)packet, strlen(packet)) == USBD_BUSY)
     {
-        HAL_Delay(1);
+        if((HAL_GetTick() - timeout) > 100)
+            return;
     }
 }
 
@@ -230,6 +216,9 @@ int is_still(float gx, float gy, float gz)
 }
 
 void analyze_motion(
+    FallState *state,
+    uint32_t *timer,
+    uint8_t *fall_detected,
     uint32_t t,
     float ax,
     float ay,
@@ -240,17 +229,16 @@ void analyze_motion(
 )
 {
     float acc = accel_mag(ax, ay, az);
-
     float gyro = gyro_mag(gx, gy, gz);
 
-    switch(fall_state)
+    switch(*state)
     {
         case NORMAL:
 
             if(acc < 0.5f)
             {
-                fall_state = FREEFALL;
-                fall_timer = t;
+                *state = FREEFALL;
+                *timer = t;
             }
 
             break;
@@ -259,11 +247,11 @@ void analyze_motion(
 
             if(acc > 2.5f)
             {
-                fall_state = IMPACT;
+                *state = IMPACT;
             }
-            else if((t - fall_timer) > 1000)
+            else if((t - *timer) > 1000)
             {
-                fall_state = NORMAL;
+                *state = NORMAL;
             }
 
             break;
@@ -272,12 +260,12 @@ void analyze_motion(
 
             if(is_flat(az) && gyro > 150.0f)
             {
-                fall_state = FLAT;
-                fall_timer = t;
+                *state = FLAT;
+                *timer = t;
             }
             else
             {
-                fall_state = NORMAL;
+                *state = NORMAL;
             }
 
             break;
@@ -285,14 +273,14 @@ void analyze_motion(
         case FLAT:
 
             if(is_still(gx, gy, gz) &&
-               ((t - fall_timer) > 1500))
+               ((t - *timer) > 1500))
             {
-                fall_detected = 1;
-                fall_state = NORMAL;
+                *fall_detected = 1;
+                *state = NORMAL;
             }
             else if(!is_still(gx, gy, gz))
             {
-                fall_state = NORMAL;
+                *state = NORMAL;
             }
 
             break;
@@ -309,56 +297,117 @@ void send_patient_packet(
 {
     char packet[256];
 
-    int err[6] = {0};
-
-    if(flags & ALERT_HR_HIGH)   err[0] = 1;
-    if(flags & ALERT_HR_LOW)    err[1] = 2;
-    if(flags & ALERT_TEMP_HIGH) err[2] = 3;
-    if(flags & ALERT_TEMP_LOW)  err[3] = 4;
-    if(flags & ALERT_SPO2_LOW)  err[4] = 5;
-    if(flags & ALERT_FALL)      err[5] = 6;
-
-    float temp_f = (temp_c * 9.0f / 5.0f) + 32.0f;
-    int t1 = (int)(temp_f * 10);
-    int t2 = (int)((temp_f + 0.1f) * 10);
-    int t3 = (int)((temp_f - 0.1f) * 10);
-
     snprintf(packet,
              sizeof(packet),
-
-             "Patient:%d;"
-             "HR:[%d,%d,%d];"
-             "SPO2:[%d,%d,%d];"
-             "TEMP:[%d.%d,%d.%d,%d.%d];"
-             "ERR:[%d,%d,%d,%d,%d,%d]\r\n",
-
+             "Patient:%d HR:%d SPO2:%.1f TEMP:%.1f FLAGS:%d\r\n",
              patient,
-
              hr,
-             hr + 1,
-             hr - 1,
+             spo2,
+             temp_c,
+             flags);
 
-             (int)spo2,
-             (int)(spo2 + 1),
-             (int)(spo2 - 1),
-
-             t1/10, abs(t1%10),
-             t2/10, abs(t2%10),
-             t3/10, abs(t3%10),
-
-             err[0],
-             err[1],
-             err[2],
-             err[3],
-             err[4],
-             err[5]
-    );
     send_packet(packet);
 }
 
-/**
-  * @brief  The application entry point.
-  */
+
+
+int parse_vp1_packet(char *line, SensorData *d)
+{
+    char *token;
+
+    token = strtok(line, ",");
+
+    if(token == NULL) return 0;
+
+    if(strcmp(token, "VP1") != 0)
+        return 0;
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->timestamp = strtoul(token, NULL, 10);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->hr = (uint16_t)atoi(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->spo2 = (float)atof(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->temp_c = (float)atof(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->ax = (float)atof(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->ay = (float)atof(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->az = (float)atof(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->gx = (float)atof(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->gy = (float)atof(token);
+
+    token = strtok(NULL, ",");
+    if(token == NULL) return 0;
+    d->gz = (float)atof(token);
+
+    return 1;
+}
+
+void process_sensor_packet(
+    int patient,
+    SensorData *d,
+    FallState *fall_state,
+    uint32_t *fall_timer,
+    uint8_t *fall_detected
+)
+{
+    uint8_t flags = 0;
+
+    flags |= analyze_hr(d->hr);
+    flags |= analyze_spo2(d->spo2);
+    flags |= analyze_temp(d->temp_c);
+
+    analyze_motion(
+        fall_state,
+        fall_timer,
+        fall_detected,
+        HAL_GetTick(),
+        d->ax,
+        d->ay,
+        d->az,
+        d->gx,
+        d->gy,
+        d->gz
+    );
+
+    if(*fall_detected)
+    {
+        flags |= ALERT_FALL;
+        *fall_detected = 0;
+    }
+
+    send_patient_packet(
+        patient,
+        d->hr,
+        d->spo2,
+        d->temp_c,
+        flags
+    );
+}
+
+/* USER CODE END 0 */
 
 int main(void)
 {
@@ -370,62 +419,122 @@ int main(void)
     MX_I2C1_Init();
     MX_I2S3_Init();
     MX_SPI1_Init();
+
+    MX_USART2_UART_Init();
+    MX_USART3_UART_Init();
+
     MX_USB_DEVICE_Init();
 
     HAL_Delay(2000);
 
     while (1)
     {
-        FakeData d = fake_data[data_index];
+        /* USART2 */
+//
+//        if(HAL_UART_Receive(&huart2, &rx2_byte, 1, 10) == HAL_OK)
+//        {
+//            if(rx2_byte == '\n')
+//            {
+//                rx2_line[rx2_index] = '\0';
+//                char debug[256];
+//                snprintf(debug, sizeof(debug), "HM19-1 RAW: %s\r\n", rx2_line);
+//                send_packet(debug);
+//
+//                SensorData d;
+//
+//                if(parse_vp1_packet(rx2_line, &d))
+//                {
+//                    process_sensor_packet(
+//                        1,
+//                        &d,
+//                        &fall_state_1,
+//                        &fall_timer_1,
+//                        &fall_detected_1
+//                    );
+//
+//                    HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);
+//                }
+//
+//                rx2_index = 0;
+//            }
+//            else if(rx2_byte != '\r')
+//            {
+//                if(rx2_index < RX_LINE_SIZE - 1)
+//                {
+//                    rx2_line[rx2_index++] = rx2_byte;
+//                }
+//            }
+//        }
+    	if (HAL_UART_Receive(&huart2, &rx2_byte, 1, 100) == HAL_OK)
+    	{
+    	    if (rx2_byte == '\n')
+    	    {
+    	        rx2_line[rx2_index] = '\0';
 
-        uint8_t flags = 0;
+    	        // DEBUG SAFE PRINT
+    	        char debug[300];
+    	        snprintf(debug, sizeof(debug), "HM19-1 RAW FINAL: %s\r\n", rx2_line);
+    	        send_packet(debug);
 
-        uint32_t current_time = HAL_GetTick();
+    	        SensorData d;
+    	        if (parse_vp1_packet(rx2_line, &d))
+    	        {
+    	            process_sensor_packet(1, &d,
+    	                                  &fall_state_1,
+    	                                  &fall_timer_1,
+    	                                  &fall_detected_1);
+    	        }
 
-        flags |= analyze_hr(d.hr);
-        flags |= analyze_spo2(d.spo2);
-        flags |= analyze_temp(d.temp_c);
+    	        rx2_index = 0;
+    	    }
+    	    else if (rx2_byte != '\r')
+    	    {
+    	        if (rx2_index < RX_LINE_SIZE - 1)
+    	        {
+    	            rx2_line[rx2_index++] = rx2_byte;
+    	        }
+    	    }
+    	}
 
-        analyze_motion(
-            current_time,
-            d.ax,
-            d.ay,
-            d.az,
-            d.gx,
-            d.gy,
-            d.gz
-        );
 
-        if(fall_detected)
+
+        /* USART3 */
+
+        if(HAL_UART_Receive(&huart3, &rx3_byte, 1, 10) == HAL_OK)
         {
-            flags |= ALERT_FALL;
-            fall_detected = 0;
+            if(rx3_byte == '\n')
+            {
+                rx3_line[rx3_index] = '\0';
+
+                SensorData d;
+
+                if(parse_vp1_packet(rx3_line, &d))
+                {
+                    process_sensor_packet(
+                        2,
+                        &d,
+                        &fall_state_2,
+                        &fall_timer_2,
+                        &fall_detected_2
+                    );
+
+                    HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_13);
+                }
+
+                rx3_index = 0;
+            }
+            else if(rx3_byte != '\r')
+            {
+                if(rx3_index < RX_LINE_SIZE - 1)
+                {
+                    rx3_line[rx3_index++] = rx3_byte;
+                }
+            }
         }
-
-        send_patient_packet(
-            1,
-            d.hr,
-            d.spo2,
-            d.temp_c,
-            flags
-        );
-
-        HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);
-
-        data_index++;
-
-        if(data_index >= FAKE_DATA_COUNT)
-        {
-            data_index = 0;
-        }
-
-        HAL_Delay(1000);
     }
 }
 
-/**
-  * @brief System Clock Configuration
-  */
+/* Clock config from WORKING USB project */
 
 void SystemClock_Config(void)
 {
@@ -475,6 +584,52 @@ void SystemClock_Config(void)
         Error_Handler();
     }
 }
+
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance = USART2;
+
+    huart2.Init.BaudRate = 9600;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_USART3_UART_Init(void)
+{
+    huart3.Instance = USART3;
+
+    huart3.Init.BaudRate = 9600;
+    huart3.Init.WordLength = UART_WORDLENGTH_8B;
+    huart3.Init.StopBits = UART_STOPBITS_1;
+    huart3.Init.Parity = UART_PARITY_NONE;
+    huart3.Init.Mode = UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* KEEP YOUR EXISTING:
+   MX_GPIO_Init()
+   MX_I2C1_Init()
+   MX_I2S3_Init()
+   MX_SPI1_Init()
+   Error_Handler()
+*/
+
+
 
 static void MX_I2C1_Init(void)
 {
@@ -560,4 +715,3 @@ void Error_Handler(void)
     {
     }
 }
-
