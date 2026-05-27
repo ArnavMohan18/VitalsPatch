@@ -1,8 +1,6 @@
 #include "sensors.h"
 #include <NimBLEDevice.h>
 
-unsigned long lastSend = 0;
-
 /* ===================== BLE GLOBALS ===================== */
 
 static NimBLEAdvertisedDevice     *foundDevice = nullptr;
@@ -11,6 +9,18 @@ static NimBLERemoteCharacteristic *chr         = nullptr;
 
 static bool shouldConnect = false;
 static bool connected     = false;
+
+/* ===================== SAMPLE BUFFER ===================== */
+
+#define PATIENT_ID   1
+#define SAMPLE_COUNT 3
+
+int   hrBuf[SAMPLE_COUNT];
+int   spo2Buf[SAMPLE_COUNT];
+float tempBuf[SAMPLE_COUNT];
+
+int      sampleIndex = 0;
+uint32_t lastSample  = 0;
 
 /* ===================== SCAN CALLBACK ===================== */
 
@@ -101,32 +111,39 @@ void connectToHM19() {
 
 /* ===================== BUILD PACKET ===================== */
 
-void buildPacket(const SensorPacket &data, char *out, size_t len) {
-  snprintf(
-      out,
-      len,
-      "<VP1,%lu,%d,%d,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,00>\n",
-      (unsigned long)millis(),
-      data.heartRate,
-      data.spo2,
-      data.temperature,
-      data.ax,
-      data.ay,
-      data.az,
-      data.gx,
-      data.gy,
-      data.gz);
+void buildPacket(char *out, size_t len) {
+
+  char hrStr[40];
+  snprintf(hrStr, sizeof(hrStr), "[%d,%d,%d]",
+           hrBuf[0], hrBuf[1], hrBuf[2]);
+
+  char spo2Str[40];
+  snprintf(spo2Str, sizeof(spo2Str), "[%d,%d,%d]",
+           spo2Buf[0], spo2Buf[1], spo2Buf[2]);
+
+  // convert C -> F: F = C * 9/5 + 32
+  char tempStr[60];
+  snprintf(tempStr, sizeof(tempStr), "[%.1f, %.1f, %.1f]",
+           tempBuf[0] * 9.0f / 5.0f + 32.0f,
+           tempBuf[1] * 9.0f / 5.0f + 32.0f,
+           tempBuf[2] * 9.0f / 5.0f + 32.0f);
+
+  const char *errStr = "[0,0,0,0,0,0]";
+
+  snprintf(out, len,
+           "Patient:%d;HR:%s;SPO2:%s;TEMP:%s;ERR:%s\n",
+           PATIENT_ID, hrStr, spo2Str, tempStr, errStr);
 }
 
 /* ===================== SEND ===================== */
 
-void sendPacket(const SensorPacket &data) {
+void sendPacket() {
 
   if (!connected || !client || !client->isConnected() || !chr) return;
 
   char packet[200];
   memset(packet, 0, sizeof(packet));
-  buildPacket(data, packet, sizeof(packet));
+  buildPacket(packet, sizeof(packet));
 
   Serial.print("[TX] ");
   Serial.print(packet);
@@ -151,7 +168,10 @@ void setup() {
   Serial.println("ESP32-C3 HM-19 SENSOR SIMULATOR");
   Serial.println("=================================");
 
-  initSensors();  // initialize MAX30102 + MPU6500
+  if (!initSensors()) {
+    Serial.println("[ERROR] Sensor init failed — halting");
+    while (true) delay(1000);
+  }
 
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
@@ -185,11 +205,24 @@ void loop() {
     NimBLEDevice::getScan()->start(0, false);
   }
 
-  if (connected && millis() - lastSend >= 1000) {
-    lastSend = millis();
+  // collect one real sensor reading per second
+  if (connected && millis() - lastSample >= 1000) {
+    lastSample = millis();
+
     SensorPacket data;
     if (readSensors(data)) {
-      sendPacket(data);
+
+      hrBuf[sampleIndex]   = data.heartRate;
+      spo2Buf[sampleIndex] = data.spo2;
+      tempBuf[sampleIndex] = data.temperature;
+
+      sampleIndex++;
+
+      // buffer full — send and reset
+      if (sampleIndex >= SAMPLE_COUNT) {
+        sendPacket();
+        sampleIndex = 0;
+      }
     }
   }
 
