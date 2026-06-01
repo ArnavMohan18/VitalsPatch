@@ -21,7 +21,7 @@
 MAX30105 particleSensor;
 
 uint32_t irBuffer[BUFFER_LEN];
-uint32_t redBuffer[BUFFER_LEN];
+uint32_t redBuffer[BUFFER_LEN]
 
 int32_t heartRate = 0;
 int32_t spo2 = 0;
@@ -56,7 +56,10 @@ static bool initMAX30102() {
     return false;
   }
 
-  particleSensor.setup(60, 4, 2, 50, 411, 4096);
+  particleSensor.setup(60, 8, 2, 100, 411, 16384);
+  byte ledCurrent = 0x7F;
+  particleSensor.setPulseAmplitudeRed(ledCurrent);
+  particleSensor.setPulseAmplitudeIR(ledCurrent);
 
   particleSensor.enableDIETEMPRDY();
 
