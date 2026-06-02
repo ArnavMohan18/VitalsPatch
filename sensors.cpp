@@ -16,12 +16,12 @@
 #define GYRO_SCALE 131.0f
 
 #define BUFFER_LEN 100
-#define REFRESH_SAMPLES 25
+#define REFRESH_SAMPLES 50
 
 MAX30105 particleSensor;
 
 uint32_t irBuffer[BUFFER_LEN];
-uint32_t redBuffer[BUFFER_LEN]
+uint32_t redBuffer[BUFFER_LEN];
 
 int32_t heartRate = 0;
 int32_t spo2 = 0;
@@ -56,8 +56,8 @@ static bool initMAX30102() {
     return false;
   }
 
-  particleSensor.setup(60, 8, 2, 100, 411, 16384);
-  byte ledCurrent = 0x7F;
+  particleSensor.setup();
+  byte ledCurrent = 0x3A;
   particleSensor.setPulseAmplitudeRed(ledCurrent);
   particleSensor.setPulseAmplitudeIR(ledCurrent);
 
@@ -143,6 +143,12 @@ static void updateVitals() {
     redBuffer[i] = particleSensor.getRed();
     irBuffer[i] = particleSensor.getIR();
 
+    // Serial.printf(
+    //   "i=%d IR=%lu RED=%lu\n",
+    //   i,
+    //   irBuffer[i],
+    //   redBuffer[i]
+    // );
     particleSensor.nextSample();
   }
 
@@ -154,6 +160,14 @@ static void updateVitals() {
     &spo2Valid,
     &heartRate,
     &hrValid
+  );
+
+  Serial.printf(
+    "HR=%ld valid=%d  SPO2=%ld valid=%d\n",
+    heartRate,
+    hrValid,
+    spo2,
+    spo2Valid
   );
 }
 
