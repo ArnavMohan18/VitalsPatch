@@ -23,4 +23,6 @@ bool initSensors();
 
 bool readSensors(SensorPacket &data);
 
+void tickSensors();
+
 #endif
