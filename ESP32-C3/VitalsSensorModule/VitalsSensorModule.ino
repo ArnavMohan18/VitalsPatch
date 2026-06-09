@@ -1,43 +1,62 @@
+/**
+ * @file VitalsSensorModule.ino
+ * @brief Patient data acquisition, data processing, and BLE transmission for the VitalsPatch wearable monitoring system.
+ * - MAX30102 and MPU6500 sensor data acquisition
+ * - Heart rate, SpO2, temperature, and fall-event analysis
+ * - Alert generation and packet formatting to send to STM32 via the BLE
+ * - Bluetooth Low Energy communication through an HM-19 module
+ * - Periodic vital-sign transmission and immediate fall alerts
+ *
+ * @author Maya Desai, Arnav Mohan, Eeshani Shilamkar
+ * @author VitalsPatch Team
+ */
+
 #include "sensors.h"
 #include <NimBLEDevice.h>
 
-//maya patient 2
+//maya patient 2, eeshani patient 1
+//similar patient id and target hm19 id for patient 1.
 #define PATIENT_ID       2
 #define TARGET_HM19_MAC  "80:6f:b0:74:44:70"
 
-/* ===================== BLE GLOBALS ===================== */
-static NimBLEAdvertisedDevice     *foundDevice = nullptr;
-static NimBLEClient               *client      = nullptr;
-static NimBLERemoteCharacteristic *chr         = nullptr;
+/* ===================== global variables for BLE ===================== */
+static NimBLEAdvertisedDevice *foundDevice = nullptr;
+static NimBLEClient *client = nullptr;
+static NimBLERemoteCharacteristic *chr = nullptr;
 static bool shouldConnect = false;
-static bool connected     = false;
+static bool connected = false;
 
-/* ===================== ALERT BITMASK ===================== */
-#define ALERT_HR_HIGH   (1 << 0)
-#define ALERT_HR_LOW    (1 << 1)
+/* ===================== alert bitmasks ===================== */
+#define ALERT_HR_HIGH (1 << 0)
+#define ALERT_HR_LOW (1 << 1)
 #define ALERT_TEMP_HIGH (1 << 2)
-#define ALERT_TEMP_LOW  (1 << 3)
-#define ALERT_SPO2_LOW  (1 << 4)
-#define ALERT_FALL      (1 << 5)
+#define ALERT_TEMP_LOW (1 << 3)
+#define ALERT_SPO2_LOW (1 << 4)
+#define ALERT_FALL (1 << 5)
 
-/* ===================== TIMING ===================== */
-#define VITAL_WINDOW_MS  20000UL          // one vital packet per 20 s
-#define VITAL_SLOTS      3                // samples spread across the window
-#define VITAL_SAMPLE_MS  (VITAL_WINDOW_MS / VITAL_SLOTS)   // ≈ 6667 ms
-#define FALL_CHECK_MS    200UL            // fall-flag poll rate
+/* ===================== global variables for timing ===================== */
+// one vital packet per 20s
+#define VITAL_WINDOW_MS  20000UL
+// samples spread across the window
+#define VITAL_SLOTS 3
+// 6667 ms
+#define VITAL_SAMPLE_MS (VITAL_WINDOW_MS / VITAL_SLOTS)
+// fall-flag poll rate
+#define FALL_CHECK_MS 200UL
+// keeps buildPacket signature stable
+#define SAMPLE_COUNT VITAL_SLOTS
 
-#define SAMPLE_COUNT     VITAL_SLOTS      // keeps buildPacket signature stable
-
-int     hrBuf[SAMPLE_COUNT];
-int     spo2Buf[SAMPLE_COUNT];
-float   tempBuf[SAMPLE_COUNT];           // stored in °C; converted in buildPacket
+int hrBuf[SAMPLE_COUNT];
+int spo2Buf[SAMPLE_COUNT];
+// stored in Celcius but converted in buildPacket later
+float tempBuf[SAMPLE_COUNT];
 
 uint32_t lastVitalSample = 0;
-uint32_t lastVitalSend   = 0;
-uint32_t lastFallCheck   = 0;
-int      vitalSlot       = 0;
+uint32_t lastVitalSend = 0;
+uint32_t lastFallCheck = 0;
+int vitalSlot = 0;
 
-/* ===================== SCAN CALLBACK ===================== */
+/* ===================== scan call back class for ble ===================== */
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *dev) override {
     Serial.print("[SCAN] Device: ");
@@ -53,7 +72,9 @@ class ScanCallbacks : public NimBLEScanCallbacks {
   }
 };
 
-/* ===================== CONNECT ===================== */
+/* ===================== connect ===================== */
+// This method connects to the respective HM19 module
+// no parameters no returns
 void connectToHM19() {
   shouldConnect = false;
   if (client != nullptr) { NimBLEDevice::deleteClient(client); client = nullptr; }
@@ -89,18 +110,18 @@ void connectToHM19() {
   Serial.println("[BLE] READY TO SEND DATA");
 }
 
-/* ===================== BUILD / SEND PACKET ===================== */
+/* ===================== build and send packets ===================== */
 uint8_t analyze_hr(int bpm) {
   uint8_t f = 0;
-  if (bpm > 0 && bpm < 60)  f |= ALERT_HR_LOW;
-  if (bpm > 120)             f |= ALERT_HR_HIGH;
+  if (bpm > 0 && bpm < 60) f |= ALERT_HR_LOW;
+  if (bpm > 120) f |= ALERT_HR_HIGH;
   return f;
 }
 
 uint8_t analyze_temp(float tempF) {
   uint8_t f = 0;
   if (tempF > 100.4f) f |= ALERT_TEMP_HIGH;
-  if (tempF < 75.0f)  f |= ALERT_TEMP_LOW; //based on finger placement
+  if (tempF < 75.0f) f |= ALERT_TEMP_LOW; // empircaly tested based on finger placement
   return f;
 }
 
@@ -108,11 +129,11 @@ uint8_t analyze_spo2(int s) {
   return (s >= 0 && s < 90) ? ALERT_SPO2_LOW : 0;
 }
 
-// fall_flag: 0 = vital packet, 1 = fall alert
+// fall_flag 0 = vital packet, 1 = fall alert
 void buildPacket(char *out, size_t len, uint8_t fall_flag) {
   char hrStr[40], spo2Str[40], tempStr[60];
-  snprintf(hrStr,   sizeof(hrStr),   "[%d,%d,%d]",   hrBuf[0], hrBuf[1], hrBuf[2]);
-  snprintf(spo2Str, sizeof(spo2Str), "[%d,%d,%d]",   spo2Buf[0], spo2Buf[1], spo2Buf[2]);
+  snprintf(hrStr, sizeof(hrStr), "[%d,%d,%d]", hrBuf[0], hrBuf[1], hrBuf[2]);
+  snprintf(spo2Str, sizeof(spo2Str), "[%d,%d,%d]", spo2Buf[0], spo2Buf[1], spo2Buf[2]);
   snprintf(tempStr, sizeof(tempStr), "[%.1f,%.1f,%.1f]",
            tempBuf[0]*9.0f/5.0f + 32.0f + 5.0f,
            tempBuf[1]*9.0f/5.0f + 32.0f + 5.0f,
@@ -120,22 +141,21 @@ void buildPacket(char *out, size_t len, uint8_t fall_flag) {
 
   uint8_t flags = 0;
 
-  // HR — average of valid (>0) samples
+  // Heart rate is average of valid samples
   float hrSum = 0; int hrCount = 0;
   for (int i = 0; i < SAMPLE_COUNT; i++)
-    if (hrBuf[i] > 0) { hrSum += hrBuf[i]; hrCount++; }
+    if (hrBuf[i] > 0) { hrSum += hrBuf[i]; hrCount++;}
   if (hrCount > 0) flags |= analyze_hr((int)(hrSum / hrCount));
 
-  // SpO2 — average of valid (>=0) samples only
+  // SpO2 is average of valid samples too
   float spo2Sum = 0; int spo2Count = 0;
   for (int i = 0; i < SAMPLE_COUNT; i++)
-    if (spo2Buf[i] >= 0) { spo2Sum += spo2Buf[i]; spo2Count++; }
+    if (spo2Buf[i] >= 0) { spo2Sum += spo2Buf[i]; spo2Count++;}
   if (spo2Count > 0) flags |= analyze_spo2((int)(spo2Sum / spo2Count));
 
-  // Temperature — convert averaged °C to °F (same offset as display string)
+  // Temperature is converts averaged °C to °F
   float avgTempC = (tempBuf[0] + tempBuf[1] + tempBuf[2]) / 3.0f;
   float avgTempF = avgTempC * 9.0f / 5.0f + 32.0f + 5.0f;
-  // avgTempF =  avgTempF + 16.0f;
   flags |= analyze_temp(avgTempF);
 
   char errStr[64];
@@ -162,7 +182,7 @@ void sendPacket(uint8_t fall_flag = 0) {
     Serial.println("[BLE] WRITE FAILED");
 }
 
-/* ===================== SETUP ===================== */
+/* ===================== setup ===================== */
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -190,8 +210,8 @@ void setup() {
 
 /* ===================== LOOP ===================== */
 void loop() {
-  tickSensors();   // always: drains FIFO, polls MPU at 50 Hz, detects falls
-
+  //polls MPU at 50 Hz, detects falls
+  tickSensors();
   if (shouldConnect && !connected) { delay(300); connectToHM19(); }
 
   if (connected && client && !client->isConnected()) {
@@ -205,13 +225,12 @@ void loop() {
 
   uint32_t now = millis();
 
-  // ── Fall alert — 200 ms poll, fires immediately on detection ─────
+  // Fall alert 200 ms poll, triggers immediately whehn detected 
   if (now - lastFallCheck >= FALL_CHECK_MS) {
     lastFallCheck = now;
     SensorPacket snap;
     readSensors(snap);
     if (snap.fallDetected) {
-      // Save vital accumulation buffers, build fall packet, then restore
       int   savedHr  [SAMPLE_COUNT];
       int   savedSpo2[SAMPLE_COUNT];
       float savedTemp[SAMPLE_COUNT];
@@ -224,7 +243,7 @@ void loop() {
         spo2Buf[i] = snap.spo2;
         tempBuf[i] = snap.temperature;
       }
-      sendPacket(1);   // fall_flag = 1
+      sendPacket(1);
 
       memcpy(hrBuf,   savedHr,   sizeof(hrBuf));
       memcpy(spo2Buf, savedSpo2, sizeof(spo2Buf));
@@ -232,7 +251,6 @@ void loop() {
     }
   }
 
-  // ── Vital sample — 3 readings spread across the 20 s window ─────
   if (now - lastVitalSample >= VITAL_SAMPLE_MS && vitalSlot < VITAL_SLOTS) {
     lastVitalSample = now;
     SensorPacket snap;
@@ -243,17 +261,15 @@ void loop() {
     vitalSlot++;
   }
 
-  // ── Vital send — one packet at the end of each 20 s window ───────
   if (now - lastVitalSend >= VITAL_WINDOW_MS) {
-    // Edge case: if a slot wasn't filled, copy the last valid one
     for (int i = vitalSlot; i < VITAL_SLOTS; i++) {
       int src = (vitalSlot > 0) ? vitalSlot - 1 : 0;
       hrBuf[i] = hrBuf[src]; spo2Buf[i] = spo2Buf[src]; tempBuf[i] = tempBuf[src];
     }
     lastVitalSend   = now;
-    lastVitalSample = now;   // re-anchor sample timer to window boundary
-    vitalSlot       = 0;
-    sendPacket(0);           // fall_flag = 0; falls sent separately above
+    lastVitalSample = now;
+    vitalSlot = 0;
+    sendPacket(0);
   }
 
   delay(20);
