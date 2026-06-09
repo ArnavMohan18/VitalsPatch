@@ -1,3 +1,9 @@
+# This dashboard is intended to run on the Raspberry Pi. It requires a GUI
+# environment (since it has the PyQt5/PyQtGraph dependencies), 
+# so it will not run in a terminal only setup like in VS code. 
+
+# Use the console input mode in console_reader() for testing without STM32 hardware.
+
 import sys
 import ast
 import threading
@@ -151,37 +157,32 @@ class VitalsDashboard(QtWidgets.QWidget):
                 )
             )
 
+    #currently on console reader set up, for stm communication, 
+    #uncomment the stm communication portion, and comment out the console reader portion 
+    #and vice versa
     def console_reader(self):
-        #For wireless bluetooth communication:
+        #For stm communication:
         # port = "/dev/ttyACM0"
         # baud_rate = 115200
 
         # while True:
         #     try:
         #         print(f"Connecting to {port}...")
-
         #         ser = serial.Serial(
         #             port=port,
         #             baudrate=baud_rate,
         #             timeout=1
         #         )
-
         #         print("Connected to STM32 USB CDC device")
-
         #         ser.reset_input_buffer()
-
         #         while True:
-
         #             if ser.in_waiting > 0:
-
         #                 packet = ser.readline() \
         #                     .decode("utf-8", errors="ignore") \
         #                     .strip()
-
         #                 if packet:
         #                     print("Received:", packet)
         #                     self.new_packet.emit(packet)
-
         #             time.sleep(0.01)
 
         #     except serial.SerialException as e:
@@ -192,10 +193,6 @@ class VitalsDashboard(QtWidgets.QWidget):
         while True:
            packet = input("Enter packet: ")
            self.new_packet.emit(packet)
-
-    
-
-
 
        
 
@@ -237,7 +234,6 @@ class VitalsDashboard(QtWidgets.QWidget):
             patient["spo2_curve"].setData(list(patient["spo2_data"]))
             patient["temp_curve"].setData(list(patient["temp_data"]))
 
-            #active_errors = [code for code in err_codes if code != 0]
             active_errors = [
                 index + 1
                 for index, flag in enumerate(err_codes)
