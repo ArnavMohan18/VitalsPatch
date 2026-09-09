@@ -1,1 +1,3 @@
 # VitalsPatch
+VitalsPatch is a wearable health monitoring system built for clinical and care environments where one practitioner needs to watch over multiple patients at once. The device continuously tracks heart rate, SpO2, body temperature, and motion, and detects falls and out-of-range vitals in real time.
+The system runs as a three-stage pipeline: a wearable sensor module (MAX30102 for HR/SpO2, MPU-6050 for motion) collects and packages data via an ESP32-C3, which transmits wirelessly to an STM32F4 for threshold-based alert processing, forwarding results over serial to a Raspberry Pi 4 that hosts a live multi-patient dashboard with prioritized alerts and per-patient event logs.
