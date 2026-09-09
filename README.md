@@ -1,2 +1,2 @@
-#VitalsPatch
+# VitalsPatch
 This branch contains Arnav Mohan's contributions to VitalsPatch, focused on sensor integration and wireless communication. Work progressed from the initial Phase 1 sensor collection structure through modularizing the sensor code into separate files, building a dedicated test sketch for the MAX30102, and iteratively debugging heart rate (BPM) calculation and sensor accuracy to ensure reliable physiological readings from the wearable module.
