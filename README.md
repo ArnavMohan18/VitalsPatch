@@ -1,1 +1,2 @@
 # VitalsPatch
+This branch contains Eeshani Shilamkar's contributions to VitalsPatch, focused on user interface design and overall project management. Work here includes building the two-patient connection UI so the Raspberry Pi dashboard can display and distinguish live data for two patients simultaneously, along with contributions to the vitals sensor module code supporting the sensor-to-dashboard pipeline.
