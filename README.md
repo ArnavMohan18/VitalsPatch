@@ -1,1 +1,2 @@
 # VitalsPatch
+This branch contains Anushka Misra's contributions to VitalsPatch, focused on hardware integration and testing along with sensor-side acquisition firmware. The core contribution is the UART transmission link between the ESP32 and STM32, implementing framed sensor data packets — with a fixed header and checksum — so physiological and motion data collected on the wearable is reliably transmitted for downstream processing, along with supporting firmware files for the sensor acquisition module.
