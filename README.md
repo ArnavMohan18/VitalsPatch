@@ -1,1 +1,2 @@
 # VitalsPatch
+This branch contains Maya Desai's contributions to VitalsPatch, focused on data processing and trend analysis on the STM32. Work began with initial STM32 analysis code and mock STM32-to-Raspberry Pi data transfer for early pipeline testing, then added Bluetooth communication support on the STM32, and culminated in extending the setup to run two STM32 devices concurrently — enabling simultaneous two-patient data processing.
