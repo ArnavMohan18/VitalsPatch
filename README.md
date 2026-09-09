@@ -69,11 +69,3 @@ VitalsPatch is a wearable health monitoring system built for clinical and care e
 | Nate Snyder | Sensor calibration & wearable assembly |
 | Anushka Misra** | Hardware integration & testing; sensor-side acquisition firmware |
 | Bobby Taing | Alert logic development & system testing |
-
-## Branches
-
-*(pending — paste `git branch -a -v` output and I'll format this table)*
-
-| Branch | Latest Commit | Description |
-|---|---|---|
-| `main` | `—` | — |
