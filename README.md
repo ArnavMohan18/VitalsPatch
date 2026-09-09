@@ -67,5 +67,5 @@ VitalsPatch is a wearable health monitoring system built for clinical and care e
 | Arnav Mohan | Sensor integration & wireless communication |
 | Maya Desai | Data processing & trend analysis (STM32) |
 | Nate Snyder | Sensor calibration & wearable assembly |
-| Anushka Misra** | Hardware integration & testing; sensor-side acquisition firmware |
+| Anushka Misra | Hardware integration & testing; sensor-side acquisition firmware |
 | Bobby Taing | Alert logic development & system testing |
